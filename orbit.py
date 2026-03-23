@@ -1,0 +1,128 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import TwistStamped
+import numpy as np
+
+class OrbitController(Node):
+    def __init__(self):
+        super().__init__('orbit_controller')
+
+        self.subscription = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            10)
+
+        self.publisher = self.create_publisher(TwistStamped, '/cmd_vel', 10)
+
+        # Orbit Parameters
+        self.target_distance = 0.5  # sabit uzaklık
+        self.forward_speed = 0.2    # Constant forward speed in m/s
+        self.orbit_direction = 1    # 1 for Counter-Clockwise (left side), -1 for Clockwise (right side)
+        self.k_orbit_dist = 2.0     # 
+        self.k_angular_p = 1.5      
+        
+        self.get_logger().info("Orbit Controller Node Started! Waiting for scan data...")
+
+    def scan_callback(self, msg):
+        ranges = np.array(msg.ranges)
+        
+        # 1. Generate an array of angles corresponding to each range
+        angles = msg.angle_min + np.arange(len(ranges)) * msg.angle_increment
+
+        # 2. Filter out invalid ranges (inf, nan, or out of bounds)
+        valid_max = 10.0 # Define a reasonable max range for your sensor
+        valid_idx = np.isfinite(ranges) & (ranges > msg.range_min) & (ranges <= valid_max)
+        
+        valid_ranges = ranges[valid_idx]
+        valid_angles = angles[valid_idx]
+
+        if len(valid_ranges) == 0:
+            return  # Exit if no valid data is seen
+
+        # 3. poları kartezyene ceviriyoruz (x,y) = rcon(a),rsin(a)
+        x = valid_ranges * np.cos(valid_angles)
+        y = valid_ranges * np.sin(valid_angles)
+        points = np.column_stack((x, y))
+
+        # 4. Sequential Euclidean Clustering
+        cluster_tolerance = 0.3  # Max distance between points to be in the same object (meters)
+        min_cluster_size = 3     # Minimum points required to form a valid object
+
+        diffs = np.linalg.norm(points[1:] - points[:-1], axis=1)
+        split_indices = np.where(diffs > cluster_tolerance)[0] + 1
+        clusters = np.split(points, split_indices)
+
+        centroids = []
+        for cluster in clusters:                                   
+            if len(cluster) >= min_cluster_size:
+                centroid = np.mean(cluster, axis=0) #merkez konum icin önemli
+                centroids.append(centroid)
+
+        if not centroids:
+            return  
+
+        # 6. Find the closest object (centroid)
+        centroids = np.array(centroids)
+        distances_to_centroids = np.linalg.norm(centroids, axis=1)
+        
+        closest_idx = np.argmin(distances_to_centroids)
+        closest_centroid = centroids[closest_idx]
+        
+        # 7. Convert centroid back to polar for the control logic
+        min_dist = distances_to_centroids[closest_idx]
+        angle = np.arctan2(closest_centroid[1], closest_centroid[0])
+
+        # ---------------------------------------------------------
+        # 8. Execute Continuous Orbit Control Logic
+        # ---------------------------------------------------------
+        cmd = TwistStamped()
+        
+        # Populate header (Required for TwistStamped, ignore if using standard Twist)
+        cmd.header.stamp = self.get_clock().now().to_msg() 
+        cmd.header.frame_id = "base_link" 
+
+        # Calculate distance error
+        error_dist = min_dist - self.target_distance
+
+        # Calculate desired angle to the object (90 degrees / pi/2)
+        base_angle = self.orbit_direction * (np.pi / 2.0)
+        
+        # Angle correction based on distance error
+        angle_correction = np.arctan(self.k_orbit_dist * error_dist)
+        
+        # Adjust desired angle based on whether we are too close or too far
+        desired_angle = base_angle - (self.orbit_direction * angle_correction)
+
+        # Calculate the angular error 
+        error_angle = angle - desired_angle
+        
+        # Normalize the error between -pi and pi to avoid wrap-around jumps
+        error_angle = np.arctan2(np.sin(error_angle), np.cos(error_angle))
+
+        # Constant linear velocity forces the robot to move
+        cmd.twist.linear.x = self.forward_speed
+        
+        # Proportional control for steering to maintain the desired angle
+        raw_angular_z = self.k_angular_p * error_angle
+        
+        # Clamp angular velocity between -1.0 and 1.0 rad/s for safety
+        cmd.twist.angular.z = float(np.clip(raw_angular_z, -1.0, 1.0))
+
+        self.publisher.publish(cmd)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = OrbitController()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("Shutting down Orbit Controller...")
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+if __name__ == '__main__':
+    main()
