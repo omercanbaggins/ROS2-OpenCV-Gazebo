@@ -40,8 +40,7 @@ class dinle(Node):
                             x=60*distance*np.cos(angle_rad)
                             y= 60*distance*np.sin(angle_rad)
                             #print(distance)
-
-                            cv2.circle(blankImage, (250+int(x), 250+int(y)), 5, (255, 255, 255), 5)
+                            blankImage[250+int(y)][250+int(x)] = 255
                 cv2.imshow("radar",blankImage)
         def findVertex(self,img):
             if img is not None:
