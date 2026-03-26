@@ -1,116 +1,109 @@
 #!/usr/bin/env python3
 
 import rclpy
-import cv2
 from rclpy.node import Node
-from std_msgs.msg import String
+import cv2
+import numpy as np
 from cv_bridge import CvBridge 
 from sensor_msgs.msg import Image
-from sensor_msgs.msg import LaserScan
-import os
-import math
-import numpy as np 
+from std_msgs.msg import Int32
 
-class dinle(Node):
-    def __init__(self, name):
-        super().__init__(name)
-        self.get_logger().info("Node started: overlap detecting with ORB + RANSAC")
+class OverlapDetector(Node):
+    def __init__(self):
+        super().__init__('overlap_detector_node')
+        self.get_logger().info("Node started: Overlap detecting with KNN + Ratio Test")
         
-        # ROS 2 Setup
-        self.listener = self.create_subscription(Image, '/camera/image_raw', self.imageCallBack, 10)
+        self.subscription = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 10)
+        self.overlap_pub = self.create_publisher(Int32, '/overlap_value', 10)
+        
         self.bridge = CvBridge()
-        
-        # State Variables
-        self.previousImage = None
-        self.current = None
-        self.windowName = "overlapDetect"
-        
-        # Initialize ORB Detector (Industry Standard)
-        # We do this once here to save CPU power
         self.orb = cv2.ORB_create(nfeatures=2000)
         
-        # Timer for reference frame update (every 5 seconds)
-        self.create_timer(5, self.timerfunc)
-
-    def timerfunc(self):
-        self.previousImage = self.current
-
-    def imageCallBack(self, msg):
-        # 1. Convert and Resize
-        cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        cv_image = cv2.resize(cv_image, (640, 480))
+        # FIX: For KNN Ratio test, we turn off crossCheck
+        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         
-        # 2. Show Main Stream
-        cv2.imshow(self.windowName, cv_image)
+        self.previous_image = None
+        self.window_name = "Current Stream"
+        self.match_window = "Overlap Alignment"
 
-        # 3. Logic: Compare Bitwise (Your original logic)
-        self.compareBitWise(self.previousImage, cv_image)
-        
-        # 4. Logic: Find Overlap with Homography (New industrial method)
-        
-        # 5. Update State and Process
-        self.current = cv_image
-        processed = self.processImage(cv_image)
-        if processed is not None:
-            cv2.imshow("CannyEdges", processed)
+    def image_callback(self, msg):
+        try:
+            current_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            current_frame = cv2.resize(current_frame, (640, 480))
+
+            if self.previous_image is None:
+                self.previous_image = current_frame
+                return
+
+            # Process Overlap
+            self.find_overlap_homography(self.previous_image, current_frame)
             
-        cv2.waitKey(10)
+            cv2.imshow(self.window_name, current_frame)
+            cv2.imshow("Reference Frame (Old)", self.previous_image)
+            cv2.waitKey(1)
 
-    def findOverlapHomography(self, i1, i2):
-        # Find keypoints and descriptors
-        kp1, des1 = self.orb.detectAndCompute(i1, None)
-        kp2, des2 = self.orb.detectAndCompute(i2, None)
+        except Exception as e:
+            self.get_logger().error(f"Error in image_callback: {str(e)}")
+
+    def find_overlap_homography(self, i1, i2):
+        # 1. Enhance Images with CLAHE
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        
+        gray1 = cv2.cvtColor(i1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(i2, cv2.COLOR_BGR2GRAY)
+        
+        # Use the enhanced versions!
+        enhanced1 = clahe.apply(gray1)
+        enhanced2 = clahe.apply(gray2)
+
+        # 2. Detect and Compute
+        kp1, des1 = self.orb.detectAndCompute(enhanced1, None)
+        kp2, des2 = self.orb.detectAndCompute(enhanced2, None)
 
         if des1 is not None and des2 is not None:
-            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-            matches = bf.match(des1, des2)
-            matches = sorted(matches, key=lambda x: x.distance)
+            # 3. Use KNN Match (k=2) for Ratio Test
+            knn_matches = self.bf.knnMatch(des1, des2, k=2)
 
-            if len(matches) > 10:
-                points1 = np.zeros((len(matches), 2), dtype=np.float32)
-                points2 = np.zeros((len(matches), 2), dtype=np.float32)
+            # 4. Apply Lowe's Ratio Test
+            # This kills the 'crazy' lines connecting handles to wheels
+            good_matches = []
+            for m_n in knn_matches:
+                if len(m_n) == 2:
+                    m, n = m_n
+                    if m.distance < 0.7 * n.distance:
+                        good_matches.append(m)
 
-                for i, m in enumerate(matches):
-                    points1[i, :] = kp1[m.queryIdx].pt
-                    points2[i, :] = kp2[m.trainIdx].pt
+            self.get_logger().info(f"Good Matches: {len(good_matches)}")
 
-                # Calculate Homography with RANSAC
-                H, mask = cv2.findHomography(points1, points2, cv2.RANSAC, 5.0)
+            # 5. Threshold Logic
+            if len(good_matches) > 7:
+                points1 = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                points2 = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
-                if H is not None:
-                    draw_params = dict(matchColor=(0, 255, 0),
-                                     singlePointColor=None,
-                                     matchesMask=mask.ravel().tolist(),
-                                     flags=2)
-                    
-                    match_vis = cv2.drawMatches(i1, kp1, i2, kp2, matches[:50], None, **draw_params)
-                    cv2.imshow("IndustrialAlignment", match_vis)
+                H, mask = cv2.findHomography(points1, points2, cv2.RANSAC, 3.0)
 
-    def compareBitWise(self, i1, i2):
-        if i1 is not None and i2 is not None:
-            resultImg = cv2.bitwise_and(i1, i2)
-            diff = cv2.absdiff(i1, i2)
-            cv2.imshow("BitwiseAND", resultImg)
-            cv2.imshow("DifferenceMap", diff)
-            cv2.imshow("old",i1)
+                if H is not None and mask is not None:
+                    # Only draw the inliers identified by RANSAC
+                    num_to_draw = min(len(good_matches), 50)
+                    draw_mask = mask.ravel().tolist()[:num_to_draw]
 
-    def getGrayScale(self, img):
-        if img is not None:     
-            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  
-        return img
+                    match_vis = cv2.drawMatches(
+                        i1, kp1, i2, kp2, 
+                        good_matches[:num_to_draw], 
+                        None, 
+                        matchesMask=draw_mask,
+                        flags=2
+                    )
+                    cv2.imshow(self.match_window, match_vis)
+            else:
+                # 6. Scene Change: If matches are too low, the camera has moved 
+                # significantly. Update the reference image to the current view.
+                self.get_logger().warn("Overlap lost. Updating reference frame.")
+                self.previous_image = i2
 
-    def processImage(self, img):
-        gray = self.getGrayScale(img)
-        if gray is not None:
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            _, threshImg = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-            cannyImg = cv2.Canny(threshImg, 50, 150)
-            return cannyImg
-        return None
-
-def main():
-    rclpy.init(args=None)   
-    node = dinle("overlap_node")
+def main(args=None):
+    rclpy.init(args=args)
+    node = OverlapDetector()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
